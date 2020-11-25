@@ -22,6 +22,8 @@ const tls = require('tls');
 const URL = require('url');
 const Long = require('long');
 const Util = require('util');
+const { Subject, EMPTY, from, of } = require('rxjs');
+const Ops = require('rxjs/operators');
 const Errors = require('../Errors');
 const IgniteClientConfiguration = require('../IgniteClientConfiguration');
 const MessageBuffer = require('./MessageBuffer');
@@ -110,11 +112,129 @@ class ClientSocket {
         this._onSocketDisconnect = onSocketDisconnect;
         this._error = null;
         this._wasConnected = false;
-        this._buffer = null;
-        this._offset = 0;
+
+        // subject to process the packets bit by bit
+        this._packetProcessorSubject = new Subject();
+        this._packetProcessorSubscription = null;
+
+        // subject to process the request responses
+        this._requestProcessorSubject = new Subject();
+        this._requestProcessorSubscription = null;
     }
 
     async connect() {
+        this._packetProcessorSubscription = this._packetProcessorSubject.pipe(
+            Ops.scan((acc, packet) => {
+                const { messageBuffer, messageLength, requestId: responseId } = acc;
+
+                if (messageBuffer && messageLength && messageBuffer.length < messageLength) {
+                    // concat the packet into the buffer
+                    Logger.logDebug('concat packet into response', responseId);
+                    messageBuffer.concat(packet);
+                    return acc;
+                }
+
+                if (messageBuffer && messageLength && messageBuffer.length > messageLength) {
+                    throw Errors.IgniteClientError.internalError('this (hopefully) should not happen');
+                }
+
+                Logger.logDebug('processing new response packet');
+
+                let buffer = MessageBuffer.from(packet, 0);
+
+                // Response length
+                let length = buffer.readInteger() + BinaryUtils.getSize(BinaryUtils.TYPE_CODE.INTEGER);
+                Logger.logDebug('incoming response length', length);
+
+                let requestId, isSuccess;
+                const isHandshake = this._state === STATE.HANDSHAKE;
+
+                if (isHandshake) {
+                    // Handshake status
+                    isSuccess = (buffer.readByte() === HANDSHAKE_SUCCESS_STATUS_CODE);
+                    requestId = this._handshakeRequestId.toString();
+                }
+                else {
+                    // Request id
+                    requestId = buffer.readLong().toString();
+                    // Status code
+                    isSuccess = (buffer.readInteger() === REQUEST_SUCCESS_STATUS_CODE);
+                }
+
+                this._logMessage(requestId, false, null);
+
+                if (buffer.length > length) {
+                    Logger.logDebug('there is more than one response from the packet, breaking them out');
+
+                    let position = 0;
+                    while (position <= buffer.length - length) {
+                        const newBuffer = Buffer.from(packet, position, length);
+                        const newMessageBuffer = MessageBuffer.from(newBuffer, buffer.position - position);
+
+                        this._requestProcessorSubject.next({
+                            messageBuffer: newMessageBuffer,
+                            messageLength: length,
+                            requestId,
+                            isSuccess,
+                            isHandshake,
+                        });
+
+                        // get next message
+                        position += length;
+
+                        if (position >= buffer.length - 1) {
+                            break;
+                        }
+
+                        buffer.position = position;
+                        length = buffer.readInteger() + BinaryUtils.getSize(BinaryUtils.TYPE_CODE.INTEGER);
+                        requestId = buffer.readLong().toString();
+                        isSuccess = (buffer.readInteger() === REQUEST_SUCCESS_STATUS_CODE);
+                        this._logMessage(requestId, false, null);
+                    }
+
+                    // reset
+                    return { messageBuffer: null, messageLength: -1 };
+                }
+
+                return { messageBuffer: buffer, messageLength: length, requestId, isSuccess, isHandshake };
+            }, { messageBuffer: null, messageLength: -1 }),
+            // let the message with exact length go through
+            Ops.filter(({ messageBuffer, messageLength }) => messageBuffer && messageBuffer.length === messageLength),
+        ).subscribe(
+            x => this._requestProcessorSubject.next(x),
+        );
+
+        this._requestProcessorSubscription = this._requestProcessorSubject.pipe(
+            Ops.concatMap(({ messageBuffer, requestId, isSuccess, isHandshake }) => {
+                this._logMessage(requestId, false, messageBuffer.data);
+
+                if (this._requests.has(requestId)) {
+                    const request = this._requests.get(requestId);
+                    this._requests.delete(requestId);
+                    if (isHandshake) {
+                        return from(this._finalizeHandshake(messageBuffer, request, isSuccess));
+                    }
+                    else {
+                        return from(this._finalizeResponse(messageBuffer, request, isSuccess));
+                    }
+                }
+                else {
+                    throw Errors.IgniteClientError.internalError('Invalid response id: ' + requestId);
+                }
+            }),
+        ).subscribe(
+            () => {
+                if (Logger.debug) {
+                    Logger.logDebug('message processed');
+                }
+            },
+            (err) => {
+                Logger.logError("Error during message processing");
+                console.error(err);
+            },
+        );
+
         return new Promise((resolve, reject) => {
             this._connectSocket(
                 this._getHandshake(CURRENT_VERSION, resolve, reject));
@@ -122,6 +242,14 @@ class ClientSocket {
     }
 
     disconnect() {
+        if (this._packetProcessorSubscription) {
+            this._packetProcessorSubscription.unsubscribe();
+        }
+
+        if (this._requestProcessorSubscription) {
+            this._requestProcessorSubscription.unsubscribe();
+        }
+
         this._disconnect(true, false);
     }
 
@@ -200,58 +328,9 @@ class ClientSocket {
         if (this._state === STATE.DISCONNECTED) {
             return;
         }
-        if (this._buffer) {
-            this._buffer.concat(message);
-            this._buffer.position = this._offset;
-        }
-        else {
-            this._buffer = MessageBuffer.from(message, 0);
-        }
-        while (this._buffer && this._offset < this._buffer.length) {
-            // Response length
-            const length = this._buffer.readInteger() + BinaryUtils.getSize(BinaryUtils.TYPE_CODE.INTEGER);
-            if (this._buffer.length < this._offset + length) {
-              break;
-            }
-            this._offset += length;
 
-            let requestId, isSuccess;
-            const isHandshake = this._state === STATE.HANDSHAKE;
-
-            if (isHandshake) {
-                // Handshake status
-                isSuccess = (this._buffer.readByte() === HANDSHAKE_SUCCESS_STATUS_CODE);
-                requestId = this._handshakeRequestId.toString();
-            }
-            else {
-                // Request id
-                requestId = this._buffer.readLong().toString();
-                // Status code
-                isSuccess = (this._buffer.readInteger() === REQUEST_SUCCESS_STATUS_CODE);
-            }
-
-            this._logMessage(requestId, false, this._buffer.data);
-
-            const buffer = this._buffer;
-            if (this._offset === this._buffer.length) {
-                this._buffer = null;
-                this._offset = 0;
-            }
-
-            if (this._requests.has(requestId)) {
-                const request = this._requests.get(requestId);
-                this._requests.delete(requestId);
-                if (isHandshake) {
-                    await this._finalizeHandshake(buffer, request, isSuccess);
-                }
-                else {
-                    await this._finalizeResponse(buffer, request, isSuccess);
-                }
-            }
-            else {
-                throw Errors.IgniteClientError.internalError('Invalid response id: ' + requestId);
-            }
-        }
+        Logger.logDebug('incoming data of size', message.length);
+        this._packetProcessorSubject.next(message);
     }
 
     async _finalizeHandshake(buffer, request, isSuccess) {
@@ -289,6 +368,8 @@ class ClientSocket {
     }
 
     async _finalizeResponse(buffer, request, isSuccess) {
+        Logger.logDebug('finalizing response', request._id.toString(), isSuccess);
+
         if (!isSuccess) {
             // Error message
             const errMessage = BinaryCommunicator.readString(buffer);
@@ -398,7 +479,7 @@ class ClientSocket {
     _logMessage(requestId, isRequest, message) {
         if (Logger.debug) {
             Logger.logDebug((isRequest ? 'Request: ' : 'Response: ') + requestId);
-            Logger.logDebug('[' + [...message] + ']');
+            // Logger.logDebug('[' + [...message] + ']');
         }
     }
 }

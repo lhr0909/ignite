@@ -166,10 +166,12 @@ class ClientSocket {
                 if (buffer.length > length) {
                     Logger.logDebug('there is more than one response from the packet, breaking them out');
 
+                    let lastPosition = 0;
                     let position = 0;
                     while (position <= buffer.length - length) {
-                        const newBuffer = Buffer.from(packet, position, length);
-                        const newMessageBuffer = MessageBuffer.from(newBuffer, buffer.position - position);
+                        const newBuffer = Buffer.allocUnsafe(length);
+                        packet.copy(newBuffer, 0, lastPosition, lastPosition + length);
+                        const newMessageBuffer = MessageBuffer.from(newBuffer, buffer.position - lastPosition);
 
                         this._requestProcessorSubject.next({
                             messageBuffer: newMessageBuffer,
@@ -186,11 +188,12 @@ class ClientSocket {
                             break;
                         }
 
+                        lastPosition = position;
                         buffer.position = position;
                         length = buffer.readInteger() + BinaryUtils.getSize(BinaryUtils.TYPE_CODE.INTEGER);
                         requestId = buffer.readLong().toString();
                         isSuccess = (buffer.readInteger() === REQUEST_SUCCESS_STATUS_CODE);
-                        this._logMessage(requestId, false, null);
+                        Logger.logDebug(lastPosition, position, length, buffer.position);
                     }
 
                     // reset
@@ -206,7 +209,9 @@ class ClientSocket {
         );
 
         this._requestProcessorSubscription = this._requestProcessorSubject.pipe(
-            Ops.concatMap(({ messageBuffer, requestId, isSuccess, isHandshake }) => {
+            Ops.concatMap(({ messageBuffer, messageLength, requestId, isSuccess, isHandshake }) => {
+                Logger.logDebug(messageBuffer.length, messageLength, requestId, isSuccess);
+
                 this._logMessage(requestId, false, messageBuffer.data);
 
                 if (this._requests.has(requestId)) {
@@ -479,7 +484,9 @@ class ClientSocket {
     _logMessage(requestId, isRequest, message) {
         if (Logger.debug) {
             Logger.logDebug((isRequest ? 'Request: ' : 'Response: ') + requestId);
-            // Logger.logDebug('[' + [...message] + ']');
+            if (message) {
+                Logger.logDebug('[' + [...message] + ']');
+            }
         }
     }
 }

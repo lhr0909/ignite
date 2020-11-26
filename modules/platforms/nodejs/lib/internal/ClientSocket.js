@@ -134,10 +134,6 @@ class ClientSocket {
                     return acc;
                 }
 
-                if (messageBuffer && messageLength && messageBuffer.length > messageLength) {
-                    throw Errors.IgniteClientError.internalError('this (hopefully) should not happen');
-                }
-
                 Logger.logDebug('processing new response packet');
 
                 let buffer = MessageBuffer.from(packet, 0);

@@ -95,6 +95,7 @@ const STATE = Object.freeze({
     DISCONNECTED : 3
 });
 
+const INTERGER_SIZE = BinaryUtils.getSize(BinaryUtils.TYPE_CODE.INTEGER);
 class ClientSocket {
 
     constructor(endpoint, config, onSocketDisconnect) {
@@ -124,82 +125,118 @@ class ClientSocket {
     async connect() {
         this._packetProcessorSubscription = this._packetProcessorSubject.pipe(
             Ops.scan((acc, packet) => {
-                const { messageBuffer, messageLength } = acc;
-                Logger.logDebug('incoming message length', packet.length, 'current buffer', Number(messageBuffer && messageBuffer.length), '/', Number(messageLength));
+                let { messageBuffer, messageLength } = acc;
+
+                Logger.logDebug(
+                    'incoming message length',
+                    packet.length,
+                    'current buffer',
+                    Number(messageBuffer && messageBuffer.length),
+                    '/',
+                    Number(messageLength),
+                );
 
                 if (messageBuffer && messageLength && messageBuffer.length < messageLength) {
                     const remainingLength = messageLength - messageBuffer.length;
+                    const newLength = messageBuffer.length + packet.length;
 
                     if (remainingLength >= packet.length) {
                         // concat the entire packet into the buffer
                         Logger.logDebug('concat entire packet into message buffer');
                         messageBuffer.concat(packet);
+                        messageBuffer.length = newLength;
                         return acc;
                     } else {
                         // concat part of the packet into the buffer and process the rest
-                        Logger.logDebug('concat part of the packet into message buffer');
-                        const remainingBuffer = Buffer.allocUnsafe(remainingLength);
-                        packet.copy(remainingBuffer, 0, 0, remainingLength);
-                        messageBuffer.concat(remainingBuffer);
+                        Logger.logDebug('concat the packet into message buffer, and cutting out part of it');
+                        messageBuffer.concat(packet);
 
-                        Logger.logDebug('sending response downstream');
-                        this._requestProcessorSubject.next({
-                            messageBuffer,
-                            messageLength,
-                        });
+                        if (messageLength > 0) {
+                            const newMessageBuffer = MessageBuffer.from(
+                                messageBuffer.buffer,
+                                messageBuffer.position,
+                                messageLength,
+                            );
+                            Logger.logDebug('new message buffer size, position and length', newMessageBuffer.capacity, newMessageBuffer.position, newMessageBuffer.length);
 
-                        const remainingPacket = Buffer.allocUnsafe(packet.length - remainingLength);
-                        packet.copy(remainingPacket, 0, remainingLength, packet.length);
-                        // re-assign
-                        packet = remainingPacket;
+                            Logger.logDebug('sending response downstream');
+                            this._requestProcessorSubject.next({
+                                messageBuffer: newMessageBuffer,
+                                messageLength,
+                            });
+
+                            messageBuffer.position = messageBuffer.position - INTERGER_SIZE + messageLength;
+                            messageBuffer.offset = messageBuffer.position;
+                            messageBuffer.length = messageBuffer.capacity - messageBuffer.position;
+                            messageLength = -1;
+                            Logger.logDebug('message buffer size, position and length', messageBuffer.capacity, messageBuffer.position, messageBuffer.length);
+                        } else {
+                            messageBuffer.length = newLength;
+                        }
                     }
                 }
 
-                Logger.logDebug('initializing new packet processing');
-                let newMessageBuffer = MessageBuffer.from(packet, 0);
-                let length = newMessageBuffer.readInteger() + BinaryUtils.getSize(BinaryUtils.TYPE_CODE.INTEGER);
-                Logger.logDebug('new message length is', length);
+                if (!messageBuffer || messageBuffer.length === messageLength) {
+                    Logger.logDebug('previous message buffer is done, use new packet');
+                    messageBuffer = MessageBuffer.from(packet, 0);
+                }
 
-                while (length < newMessageBuffer.length) {
+                if (messageBuffer.length < INTERGER_SIZE) {
+                    Logger.logDebug('not enough leftover to determine messageLength');
+                    return {
+                        messageBuffer,
+                        messageLength: -1,
+                    };
+                }
+
+                Logger.logDebug('initializing new packet processing');
+                let length = messageBuffer.readInteger() + INTERGER_SIZE;
+                Logger.logDebug('next message length is', length);
+
+                while (length < messageBuffer.length) {
                     Logger.logDebug('more than 1 message in the buffer, breaking it down');
 
-                    // copy the offset
-                    const newPacket = Buffer.allocUnsafe(length);
-                    packet.copy(newPacket, 0, 0, length);
+                    const newMessageBuffer = MessageBuffer.from(
+                        messageBuffer.buffer,
+                        messageBuffer.position,
+                        length,
+                    );
+                    Logger.logDebug('new message buffer size, position and length', newMessageBuffer.capacity, newMessageBuffer.position, newMessageBuffer.length);
 
                     // send to downstream
+                    Logger.logDebug('sending response downstream');
                     this._requestProcessorSubject.next({
-                        messageBuffer: MessageBuffer.from(newPacket, 0),
+                        messageBuffer: newMessageBuffer,
                         messageLength: length,
                     });
 
-                    // get remaining packet as buffer
-                    const remainingPacket = Buffer.allocUnsafe(packet.length - length);
-                    packet.copy(remainingPacket, 0, length, packet.length);
-                    packet = remainingPacket;
+                    messageBuffer.position = messageBuffer.position - INTERGER_SIZE + length;
+                    messageBuffer.offset = messageBuffer.position;
+                    messageBuffer.length = messageBuffer.capacity - messageBuffer.position;
+                    Logger.logDebug('message buffer size, position and length', messageBuffer.capacity, messageBuffer.position, messageBuffer.length);
 
-                    newMessageBuffer = MessageBuffer.from(packet, 0);
-                    length = newMessageBuffer.readInteger() + BinaryUtils.getSize(BinaryUtils.TYPE_CODE.INTEGER);
-                    Logger.logDebug('new message length is', length);
+                    length = messageBuffer.readInteger() + INTERGER_SIZE;
+                    Logger.logDebug('next message length is', length);
                 }
 
                 // return for the rest of the cases
                 return {
-                    messageBuffer: newMessageBuffer,
+                    messageBuffer,
                     messageLength: length,
                 };
             }, { messageBuffer: null, messageLength: -1 }),
             // let the message with exact length go through
             Ops.filter(({ messageBuffer, messageLength }) => messageBuffer && messageBuffer.length === messageLength),
-        ).subscribe(
-            x => this._requestProcessorSubject.next(x),
-        );
+        ).subscribe(x => {
+            Logger.logDebug('message buffer with exact length with message length found, sending downstream for processing');
+            this._requestProcessorSubject.next(x);
+        });
 
         this._requestProcessorSubscription = this._requestProcessorSubject.pipe(
             Ops.concatMap(({ messageBuffer, messageLength }) => {
                 // always reset position
-                messageBuffer.position = 0;
-                const length = messageBuffer.readInteger() + BinaryUtils.getSize(BinaryUtils.TYPE_CODE.INTEGER);
+                messageBuffer.position = messageBuffer.position - INTERGER_SIZE;
+                const length = messageBuffer.readInteger() + INTERGER_SIZE;
 
                 if (length !== messageLength) {
                     Logger.logError('message length mismatch', messageLength, length);
@@ -379,6 +416,8 @@ class ClientSocket {
             this._wasConnected = true;
             request.resolve();
         }
+
+        return request._id.toString();
     }
 
     async _finalizeResponse(buffer, request, isSuccess) {
@@ -400,6 +439,8 @@ class ClientSocket {
                 request.reject(err);
             }
         }
+
+        return request._id.toString();
     }
 
     async _handshakePayloadWriter(payload) {
@@ -527,7 +568,7 @@ class Request {
     }
 
     async getMessage() {
-        const message = new MessageBuffer();
+        const message = new MessageBuffer(true);
         // Skip message length
         const messageStartPos = BinaryUtils.getSize(BinaryUtils.TYPE_CODE.INTEGER);
         message.position = messageStartPos;

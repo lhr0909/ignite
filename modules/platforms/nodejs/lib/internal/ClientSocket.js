@@ -136,43 +136,43 @@ class ClientSocket {
                     Number(messageLength),
                 );
 
-                if (messageBuffer && messageLength && messageBuffer.length < messageLength) {
+                if (messageBuffer && messageLength && messageBuffer.length !== messageLength) {
                     const remainingLength = messageLength - messageBuffer.length;
                     const newLength = messageBuffer.length + packet.length;
+                    messageBuffer.concat(packet);
 
-                    if (remainingLength >= packet.length) {
-                        // concat the entire packet into the buffer
-                        Logger.logDebug('concat entire packet into message buffer');
-                        messageBuffer.concat(packet);
+                    if (messageLength <= 0) {
+                        Logger.logDebug('buffer ready for processing');
                         messageBuffer.length = newLength;
-                        return acc;
                     } else {
+                        if (remainingLength >= packet.length) {
+                            // concat the entire packet into the buffer
+                            Logger.logDebug('concat entire packet into message buffer and wait for next one');
+                            messageBuffer.length = newLength;
+                            return acc;
+                        }
+
                         // concat part of the packet into the buffer and process the rest
                         Logger.logDebug('concat the packet into message buffer, and cutting out part of it');
-                        messageBuffer.concat(packet);
 
-                        if (messageLength > 0) {
-                            const newMessageBuffer = MessageBuffer.from(
-                                messageBuffer.buffer,
-                                messageBuffer.position,
-                                messageLength,
-                            );
-                            Logger.logDebug('new message buffer size, position and length', newMessageBuffer.capacity, newMessageBuffer.position, newMessageBuffer.length);
+                        const newMessageBuffer = MessageBuffer.from(
+                            messageBuffer.buffer,
+                            messageBuffer.position,
+                            messageLength,
+                        );
+                        Logger.logDebug('new message buffer size, position and length', newMessageBuffer.capacity, newMessageBuffer.position, newMessageBuffer.length);
 
-                            Logger.logDebug('sending response downstream');
-                            this._requestProcessorSubject.next({
-                                messageBuffer: newMessageBuffer,
-                                messageLength,
-                            });
+                        Logger.logDebug('sending response downstream');
+                        this._requestProcessorSubject.next({
+                            messageBuffer: newMessageBuffer,
+                            messageLength,
+                        });
 
-                            messageBuffer.position = messageBuffer.position - INTERGER_SIZE + messageLength;
-                            messageBuffer.offset = messageBuffer.position;
-                            messageBuffer.length = messageBuffer.capacity - messageBuffer.position;
-                            messageLength = -1;
-                            Logger.logDebug('message buffer size, position and length', messageBuffer.capacity, messageBuffer.position, messageBuffer.length);
-                        } else {
-                            messageBuffer.length = newLength;
-                        }
+                        messageBuffer.position = messageBuffer.position - INTERGER_SIZE + messageLength;
+                        messageBuffer.offset = messageBuffer.position;
+                        messageBuffer.length = messageBuffer.capacity - messageBuffer.position;
+                        messageLength = -1;
+                        Logger.logDebug('message buffer size, position and length', messageBuffer.capacity, messageBuffer.position, messageBuffer.length);
                     }
                 }
 

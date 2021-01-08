@@ -22,8 +22,9 @@ const tls = require('tls');
 const URL = require('url');
 const Long = require('long');
 const Util = require('util');
+const { Subject, from } = require('rxjs');
+const Ops = require('rxjs/operators');
 const Errors = require('../Errors');
-const IgniteClientConfiguration = require('../IgniteClientConfiguration');
 const MessageBuffer = require('./MessageBuffer');
 const BinaryUtils = require('./BinaryUtils');
 const BinaryCommunicator = require('./BinaryCommunicator');
@@ -94,6 +95,7 @@ const STATE = Object.freeze({
     DISCONNECTED : 3
 });
 
+const INTERGER_SIZE = BinaryUtils.getSize(BinaryUtils.TYPE_CODE.INTEGER);
 class ClientSocket {
 
     constructor(endpoint, config, onSocketDisconnect) {
@@ -110,11 +112,180 @@ class ClientSocket {
         this._onSocketDisconnect = onSocketDisconnect;
         this._error = null;
         this._wasConnected = false;
-        this._buffer = null;
-        this._offset = 0;
+
+        // subject to process the packets bit by bit
+        this._packetProcessorSubject = new Subject();
+        this._packetProcessorSubscription = null;
+
+        // subject to process the request responses
+        this._requestProcessorSubject = new Subject();
+        this._requestProcessorSubscription = null;
     }
 
     async connect() {
+        this._packetProcessorSubscription = this._packetProcessorSubject.pipe(
+            Ops.scan((acc, packet) => {
+                let { messageBuffer, messageLength } = acc;
+
+                Logger.logDebug(
+                    'incoming message length',
+                    packet.length,
+                    'current buffer',
+                    Number(messageBuffer && messageBuffer.length),
+                    '/',
+                    Number(messageLength),
+                );
+
+                if (messageBuffer && messageLength && messageBuffer.length !== messageLength) {
+                    const remainingLength = messageLength - messageBuffer.length;
+                    const newLength = messageBuffer.length + packet.length;
+                    messageBuffer.concat(packet);
+
+                    if (messageLength <= 0) {
+                        Logger.logDebug('buffer ready for processing');
+                        messageBuffer.length = newLength;
+                    } else {
+                        if (remainingLength >= packet.length) {
+                            // concat the entire packet into the buffer
+                            Logger.logDebug('concat entire packet into message buffer and wait for next one');
+                            messageBuffer.length = newLength;
+                            return acc;
+                        }
+
+                        // concat part of the packet into the buffer and process the rest
+                        Logger.logDebug('concat the packet into message buffer, and cutting out part of it');
+
+                        const newMessageBuffer = MessageBuffer.from(
+                            messageBuffer.buffer,
+                            messageBuffer.position,
+                            messageLength,
+                        );
+                        Logger.logDebug('new message buffer size, position and length', newMessageBuffer.capacity, newMessageBuffer.position, newMessageBuffer.length);
+
+                        Logger.logDebug('sending response downstream');
+                        this._requestProcessorSubject.next({
+                            messageBuffer: newMessageBuffer,
+                            messageLength,
+                        });
+
+                        messageBuffer.position = messageBuffer.position - INTERGER_SIZE + messageLength;
+                        messageBuffer.offset = messageBuffer.position;
+                        messageBuffer.length = messageBuffer.capacity - messageBuffer.position;
+                        messageLength = -1;
+                        Logger.logDebug('message buffer size, position and length', messageBuffer.capacity, messageBuffer.position, messageBuffer.length);
+                    }
+                }
+
+                if (!messageBuffer || messageBuffer.length === messageLength) {
+                    Logger.logDebug('previous message buffer is done, use new packet');
+                    messageBuffer = MessageBuffer.from(packet, 0);
+                }
+
+                if (messageBuffer.length < INTERGER_SIZE) {
+                    Logger.logDebug('not enough leftover to determine messageLength');
+                    return {
+                        messageBuffer,
+                        messageLength: -1,
+                    };
+                }
+
+                Logger.logDebug('initializing new packet processing');
+                let length = messageBuffer.readInteger() + INTERGER_SIZE;
+                Logger.logDebug('next message length is', length);
+
+                while (length < messageBuffer.length) {
+                    Logger.logDebug('more than 1 message in the buffer, breaking it down');
+
+                    const newMessageBuffer = MessageBuffer.from(
+                        messageBuffer.buffer,
+                        messageBuffer.position,
+                        length,
+                    );
+                    Logger.logDebug('new message buffer size, position and length', newMessageBuffer.capacity, newMessageBuffer.position, newMessageBuffer.length);
+
+                    // send to downstream
+                    Logger.logDebug('sending response downstream');
+                    this._requestProcessorSubject.next({
+                        messageBuffer: newMessageBuffer,
+                        messageLength: length,
+                    });
+
+                    messageBuffer.position = messageBuffer.position - INTERGER_SIZE + length;
+                    messageBuffer.offset = messageBuffer.position;
+                    messageBuffer.length = messageBuffer.capacity - messageBuffer.position;
+                    Logger.logDebug('message buffer size, position and length', messageBuffer.capacity, messageBuffer.position, messageBuffer.length);
+
+                    length = messageBuffer.readInteger() + INTERGER_SIZE;
+                    Logger.logDebug('next message length is', length);
+                }
+
+                // return for the rest of the cases
+                return {
+                    messageBuffer,
+                    messageLength: length,
+                };
+            }, { messageBuffer: null, messageLength: -1 }),
+            // let the message with exact length go through
+            Ops.filter(({ messageBuffer, messageLength }) => messageBuffer && messageBuffer.length === messageLength),
+        ).subscribe(x => {
+            Logger.logDebug('message buffer with exact length with message length found, sending downstream for processing');
+            this._requestProcessorSubject.next(x);
+        });
+
+        this._requestProcessorSubscription = this._requestProcessorSubject.pipe(
+            Ops.concatMap(({ messageBuffer, messageLength }) => {
+                // always reset position
+                messageBuffer.position = messageBuffer.position - INTERGER_SIZE;
+                const length = messageBuffer.readInteger() + INTERGER_SIZE;
+
+                if (length !== messageLength) {
+                    Logger.logError('message length mismatch', messageLength, length);
+                    throw new Error('message length mismatch');
+                }
+
+                let requestId, isSuccess;
+                const isHandshake = this._state === STATE.HANDSHAKE;
+
+                if (isHandshake) {
+                    // Handshake status
+                    isSuccess = (messageBuffer.readByte() === HANDSHAKE_SUCCESS_STATUS_CODE);
+                    requestId = this._handshakeRequestId.toString();
+                }
+                else {
+                    // Request id
+                    requestId = messageBuffer.readLong().toString();
+                    // Status code
+                    isSuccess = (messageBuffer.readInteger() === REQUEST_SUCCESS_STATUS_CODE);
+                }
+
+                this._logMessage(requestId, false, messageBuffer.data);
+
+                if (this._requests.has(requestId)) {
+                    const request = this._requests.get(requestId);
+                    this._requests.delete(requestId);
+                    if (isHandshake) {
+                        return from(this._finalizeHandshake(messageBuffer, request, isSuccess));
+                    }
+                    else {
+                        return from(this._finalizeResponse(messageBuffer, request, isSuccess));
+                    }
+                }
+                else {
+                    throw Errors.IgniteClientError.internalError('Invalid response id: ' + requestId);
+                }
+            }),
+        ).subscribe(
+            (requestId) => {
+                if (Logger.debug) {
+                    Logger.logDebug('message', requestId, 'processed');
+                }
+            },
+            (err) => {
+                Logger.logError("Error during message processing");
+                console.error(err);
+            },
+        );
+
         return new Promise((resolve, reject) => {
             this._connectSocket(
                 this._getHandshake(CURRENT_VERSION, resolve, reject));
@@ -122,6 +293,14 @@ class ClientSocket {
     }
 
     disconnect() {
+        if (this._packetProcessorSubscription) {
+            this._packetProcessorSubscription.unsubscribe();
+        }
+
+        if (this._requestProcessorSubscription) {
+            this._requestProcessorSubscription.unsubscribe();
+        }
+
         this._disconnect(true, false);
     }
 
@@ -200,58 +379,9 @@ class ClientSocket {
         if (this._state === STATE.DISCONNECTED) {
             return;
         }
-        if (this._buffer) {
-            this._buffer.concat(message);
-            this._buffer.position = this._offset;
-        }
-        else {
-            this._buffer = MessageBuffer.from(message, 0);
-        }
-        while (this._buffer && this._offset < this._buffer.length) {
-            // Response length
-            const length = this._buffer.readInteger() + BinaryUtils.getSize(BinaryUtils.TYPE_CODE.INTEGER);
-            if (this._buffer.length < this._offset + length) {
-              break;
-            }
-            this._offset += length;
 
-            let requestId, isSuccess;
-            const isHandshake = this._state === STATE.HANDSHAKE;
-
-            if (isHandshake) {
-                // Handshake status
-                isSuccess = (this._buffer.readByte() === HANDSHAKE_SUCCESS_STATUS_CODE);
-                requestId = this._handshakeRequestId.toString();
-            }
-            else {
-                // Request id
-                requestId = this._buffer.readLong().toString();
-                // Status code
-                isSuccess = (this._buffer.readInteger() === REQUEST_SUCCESS_STATUS_CODE);
-            }
-
-            this._logMessage(requestId, false, this._buffer.data);
-
-            const buffer = this._buffer;
-            if (this._offset === this._buffer.length) {
-                this._buffer = null;
-                this._offset = 0;
-            }
-
-            if (this._requests.has(requestId)) {
-                const request = this._requests.get(requestId);
-                this._requests.delete(requestId);
-                if (isHandshake) {
-                    await this._finalizeHandshake(buffer, request, isSuccess);
-                }
-                else {
-                    await this._finalizeResponse(buffer, request, isSuccess);
-                }
-            }
-            else {
-                throw Errors.IgniteClientError.internalError('Invalid response id: ' + requestId);
-            }
-        }
+        Logger.logDebug('incoming data of size', message.length);
+        this._packetProcessorSubject.next(message);
     }
 
     async _finalizeHandshake(buffer, request, isSuccess) {
@@ -286,9 +416,13 @@ class ClientSocket {
             this._wasConnected = true;
             request.resolve();
         }
+
+        return request._id.toString();
     }
 
     async _finalizeResponse(buffer, request, isSuccess) {
+        Logger.logDebug('finalizing response', request._id.toString(), isSuccess);
+
         if (!isSuccess) {
             // Error message
             const errMessage = BinaryCommunicator.readString(buffer);
@@ -299,12 +433,14 @@ class ClientSocket {
                 if (request.payloadReader) {
                     await request.payloadReader(buffer);
                 }
-                request.resolve();
+                request.resolve(request._id.toString());
             }
             catch (err) {
                 request.reject(err);
             }
         }
+
+        return request._id.toString();
     }
 
     async _handshakePayloadWriter(payload) {
@@ -398,7 +534,9 @@ class ClientSocket {
     _logMessage(requestId, isRequest, message) {
         if (Logger.debug) {
             Logger.logDebug((isRequest ? 'Request: ' : 'Response: ') + requestId);
-            Logger.logDebug('[' + [...message] + ']');
+            // if (message) {
+            //     Logger.logDebug('[' + [...message] + ']');
+            // }
         }
     }
 }
@@ -430,7 +568,7 @@ class Request {
     }
 
     async getMessage() {
-        const message = new MessageBuffer();
+        const message = new MessageBuffer(true);
         // Skip message length
         const messageStartPos = BinaryUtils.getSize(BinaryUtils.TYPE_CODE.INTEGER);
         message.position = messageStartPos;

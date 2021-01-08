@@ -26,26 +26,33 @@ const BYTE_ZERO = 0;
 const BYTE_ONE = 1;
 
 class MessageBuffer {
-    constructor(capacity = BUFFER_CAPACITY_DEFAULT) {
-        this._buffer = Buffer.allocUnsafe(capacity);
-        this._capacity = capacity;
+    constructor(alloc = false, capacity = BUFFER_CAPACITY_DEFAULT) {
+        if (alloc) {
+            this._buffer = Buffer.allocUnsafe(capacity);
+            this._capacity = capacity;
+        }
+
+        this._offset = 0;
         this._length = 0;
         this._position = 0;
     }
 
-    static from(source, position) {
+    static from(source, position, length) {
         const buf = new MessageBuffer();
         buf._buffer = Buffer.from(source);
         buf._position = position;
-        buf._length = buf._buffer.length;
-        buf._capacity = buf._length;
+        buf._offset = position;
+        buf._capacity = buf._buffer.length;
+        buf._length = length || buf._buffer.length;
         return buf;
     }
 
     concat(source) {
-        this._buffer = Buffer.concat([this._buffer, source]);
-        this._length = this._buffer.length;
-        this._capacity = this._length;
+        const originalLength = this._buffer.length;
+        const sourceLength = source.length;
+        this._buffer = Buffer.concat([this._buffer, source], originalLength + sourceLength);
+        this._length = originalLength + sourceLength;
+        this._capacity = this._buffer.length;
     }
 
     get position() {
@@ -58,6 +65,22 @@ class MessageBuffer {
 
     get length() {
         return this._length;
+    }
+
+    set length(length) {
+        this._length = length;
+    }
+
+    get offset() {
+        return this._offset;
+    }
+
+    set offset(offset) {
+        this._offset = offset;
+    }
+
+    get capacity() {
+        return this._capacity;
     }
 
     get data() {
@@ -267,7 +290,7 @@ class MessageBuffer {
     }
 
     _ensureSize(size) {
-        if (this._position + size > this._length) {
+        if (this._position + size > this._offset + this._length) {
             throw Errors.IgniteClientError.internalError('Unexpected format of response');
         }
     }
@@ -284,7 +307,7 @@ class MessageBuffer {
             this._buffer = Buffer.concat([this._buffer, Buffer.allocUnsafe(newCapacity - this._capacity)], newCapacity);
             this._capacity = newCapacity;
         }
-        if (this._position + valueSize > this._length) {
+        if (this._position + valueSize > this._offset + this._length) {
             this._length = this._position + valueSize;
         }
     }

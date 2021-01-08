@@ -23,8 +23,9 @@
     "node": ">=8.0.0"
   },
   "dependencies": {
+    "decimal.js": "latest",
     "long": "latest",
-    "decimal.js": "latest"
+    "rxjs": "^6.6.3"
   },
   "scripts": {
     "test": "jasmine",
@@ -37,4 +38,3 @@
     "jasmine-reporters": "2.1.1"
   }
 }
-
